@@ -19,6 +19,7 @@ import org.slf4j.LoggerFactory;
 /** Various Http helper routines */
 public final class HttpUtils {
     private static final Logger logger = LoggerFactory.getLogger(HttpUtils.class);
+    private static final int MAX_REDIRECTS = 10;
 
     private HttpUtils() {}
 
@@ -51,39 +52,101 @@ public final class HttpUtils {
                             "Miss environment variables "
                                     + "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY or AWS_DEFAULT_REGION");
                 }
-
-                HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-                headers = new HashMap<>();
-                headers.put("x-amz-content-sha256", AWS4SignerBase.EMPTY_BODY_SHA256);
-
-                AWS4SignerForAuthorizationHeader signer =
-                        new AWS4SignerForAuthorizationHeader(
-                                connection.getURL(), "GET", "s3", regionName);
-                String authorization =
-                        signer.computeSignature(
-                                headers,
-                                null, // no query parameters
-                                AWS4SignerBase.EMPTY_BODY_SHA256,
-                                awsAccessKey,
-                                awsSecretKey);
-
-                // place the computed signature into a formatted 'Authorization' header
-                // and call S3
-                headers.put("Authorization", authorization);
-                setHttpConnection(connection, "GET", headers);
-                try {
-                    FileUtils.copyInputStreamToFile(connection.getInputStream(), modelLocation);
-                } finally {
-                    if (connection != null) {
-                        connection.disconnect();
-                    }
-                }
+                copyHttpUrlToFile(
+                        allowedUrls,
+                        new URL(url),
+                        modelLocation,
+                        awsAccessKey,
+                        awsSecretKey,
+                        regionName);
             } else {
                 URL endpointUrl = new URL(url);
-                FileUtils.copyURLToFile(endpointUrl, modelLocation);
+                if ("http".equalsIgnoreCase(endpointUrl.getProtocol())
+                        || "https".equalsIgnoreCase(endpointUrl.getProtocol())) {
+                    copyHttpUrlToFile(allowedUrls, endpointUrl, modelLocation, null, null, null);
+                } else {
+                    FileUtils.copyURLToFile(endpointUrl, modelLocation);
+                }
             }
         }
         return false;
+    }
+
+    private static void copyHttpUrlToFile(
+            List<String> allowedUrls,
+            URL endpointUrl,
+            File modelLocation,
+            String awsAccessKey,
+            String awsSecretKey,
+            String regionName)
+            throws IOException, InvalidArchiveURLException {
+        URL currentUrl = endpointUrl;
+        int redirectCount = 0;
+
+        while (true) {
+            if (redirectCount > MAX_REDIRECTS) {
+                throw new IOException("Too many redirects while downloading archive from: " + endpointUrl);
+            }
+
+            HttpURLConnection connection = (HttpURLConnection) currentUrl.openConnection();
+            Map<String, String> headers = buildHeaders(connection, awsAccessKey, awsSecretKey, regionName);
+            connection.setInstanceFollowRedirects(false);
+            setHttpConnection(connection, "GET", headers);
+
+            try {
+                int statusCode = connection.getResponseCode();
+                if (isRedirect(statusCode)) {
+                    String location = connection.getHeaderField("Location");
+                    if (location == null || location.isEmpty()) {
+                        throw new IOException("Redirect response missing Location header for: " + currentUrl);
+                    }
+
+                    URL redirectUrl = new URL(currentUrl, location);
+                    ArchiveUtils.validateURL(allowedUrls, redirectUrl.toString());
+                    currentUrl = redirectUrl;
+                    redirectCount += 1;
+                    continue;
+                }
+
+                FileUtils.copyInputStreamToFile(connection.getInputStream(), modelLocation);
+                return;
+            } finally {
+                connection.disconnect();
+            }
+        }
+    }
+
+    private static Map<String, String> buildHeaders(
+            HttpURLConnection connection,
+            String awsAccessKey,
+            String awsSecretKey,
+            String regionName)
+            throws IOException {
+        Map<String, String> headers = new HashMap<>();
+        if (regionName == null) {
+            return headers;
+        }
+
+        headers.put("x-amz-content-sha256", AWS4SignerBase.EMPTY_BODY_SHA256);
+        AWS4SignerForAuthorizationHeader signer =
+                new AWS4SignerForAuthorizationHeader(connection.getURL(), "GET", "s3", regionName);
+        String authorization =
+                signer.computeSignature(
+                        headers,
+                        null,
+                        AWS4SignerBase.EMPTY_BODY_SHA256,
+                        awsAccessKey,
+                        awsSecretKey);
+        headers.put("Authorization", authorization);
+        return headers;
+    }
+
+    private static boolean isRedirect(int statusCode) {
+        return statusCode == HttpURLConnection.HTTP_MOVED_PERM
+                || statusCode == HttpURLConnection.HTTP_MOVED_TEMP
+                || statusCode == HttpURLConnection.HTTP_SEE_OTHER
+                || statusCode == 307
+                || statusCode == 308;
     }
 
     public static void setHttpConnection(

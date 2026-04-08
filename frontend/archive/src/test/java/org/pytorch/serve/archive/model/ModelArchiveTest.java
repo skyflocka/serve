@@ -2,10 +2,16 @@ package org.pytorch.serve.archive.model;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import com.sun.net.httpserver.HttpServer;
 import org.apache.commons.io.FileUtils;
 import org.pytorch.serve.archive.DownloadArchiveException;
 import org.testng.Assert;
@@ -229,6 +235,71 @@ public class ModelArchiveTest {
                 ALLOWED_URLS_LIST,
                 modelStore,
                 "https://torchserve.pytorch.org/mar_files/mnist.mar");
+    }
+
+    @Test
+    public void testRedirectTargetNotRevalidatedAgainstAllowedUrls()
+            throws Exception {
+        String modelStore = "build/tmp/test/model_store_redirect";
+        File modelStoreDir = new File(modelStore);
+        FileUtils.deleteQuietly(modelStoreDir);
+        modelStoreDir.mkdirs();
+
+        File marFixture = new File("src/test/resources/models/mnist.mar");
+        byte[] marBytes = Files.readAllBytes(marFixture.toPath());
+
+        HttpServer secondHopServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        secondHopServer.createContext(
+                "/blocked.mar",
+                exchange -> {
+                    exchange.sendResponseHeaders(200, marBytes.length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(marBytes);
+                    }
+                });
+        ExecutorService secondHopExecutor = Executors.newSingleThreadExecutor();
+        secondHopServer.setExecutor(secondHopExecutor);
+        secondHopServer.start();
+        int secondPort = secondHopServer.getAddress().getPort();
+
+        HttpServer firstHopServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        firstHopServer.createContext(
+                "/allowed.mar",
+                exchange -> {
+                    String location = "http://127.0.0.1:" + secondPort + "/blocked.mar";
+                    exchange.getResponseHeaders().add("Location", location);
+                    exchange.sendResponseHeaders(302, -1);
+                    exchange.close();
+                });
+        ExecutorService firstHopExecutor = Executors.newSingleThreadExecutor();
+        firstHopServer.setExecutor(firstHopExecutor);
+        firstHopServer.start();
+        int firstPort = firstHopServer.getAddress().getPort();
+
+        String allowedPattern = "http://127\\.0\\.0\\.1:" + firstPort + "/.*";
+        List<String> strictAllowed = Collections.singletonList(allowedPattern);
+        String registrationUrl = "http://127.0.0.1:" + firstPort + "/allowed.mar";
+        String blockedUrl = "http://127.0.0.1:" + secondPort + "/blocked.mar";
+
+        try {
+            File downloaded = new File(modelStore, "allowed.mar");
+            ModelNotFoundException exception =
+                    Assert.expectThrows(
+                            ModelNotFoundException.class,
+                            () -> ModelArchive.downloadModel(strictAllowed, modelStore, registrationUrl));
+            Assert.assertEquals(
+                    exception.getMessage(),
+                    "Given URL " + blockedUrl + " does not match any allowed URL(s)");
+            Assert.assertFalse(
+                    downloaded.exists(),
+                    "Model archive should not be downloaded when a redirect leaves allowed_urls");
+        } finally {
+            firstHopServer.stop(0);
+            secondHopServer.stop(0);
+            firstHopExecutor.shutdownNow();
+            secondHopExecutor.shutdownNow();
+            FileUtils.deleteQuietly(modelStoreDir);
+        }
     }
 
     @Test(expectedExceptions = DownloadArchiveException.class)
