@@ -302,6 +302,95 @@ public class ModelArchiveTest {
         }
     }
 
+    @Test
+    public void testRedirectMissingLocationHeaderFailsDownload()
+            throws Exception {
+        String modelStore = "build/tmp/test/model_store_missing_location";
+        File modelStoreDir = new File(modelStore);
+        FileUtils.deleteQuietly(modelStoreDir);
+        modelStoreDir.mkdirs();
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/missing-location.mar",
+                exchange -> {
+                    exchange.sendResponseHeaders(302, -1);
+                    exchange.close();
+                });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        server.setExecutor(executor);
+        server.start();
+        int port = server.getAddress().getPort();
+
+        String registrationUrl = "http://127.0.0.1:" + port + "/missing-location.mar";
+        List<String> strictAllowed =
+                Collections.singletonList("http://127\\.0\\.0\\.1:" + port + "/.*");
+
+        try {
+            File downloaded = new File(modelStore, "missing-location.mar");
+            DownloadArchiveException exception =
+                    Assert.expectThrows(
+                            DownloadArchiveException.class,
+                            () -> ModelArchive.downloadModel(strictAllowed, modelStore, registrationUrl));
+            Assert.assertTrue(exception.getCause() instanceof IOException);
+            Assert.assertEquals(
+                    exception.getCause().getMessage(),
+                    "Redirect response missing Location header for: " + registrationUrl);
+            Assert.assertFalse(
+                    downloaded.exists(),
+                    "Model archive should not be written when a redirect omits Location");
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            FileUtils.deleteQuietly(modelStoreDir);
+        }
+    }
+
+    @Test
+    public void testRedirectLoopFailsAfterMaxRedirects()
+            throws Exception {
+        String modelStore = "build/tmp/test/model_store_redirect_loop";
+        File modelStoreDir = new File(modelStore);
+        FileUtils.deleteQuietly(modelStoreDir);
+        modelStoreDir.mkdirs();
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/loop.mar",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Location", "/loop.mar");
+                    exchange.sendResponseHeaders(302, -1);
+                    exchange.close();
+                });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        server.setExecutor(executor);
+        server.start();
+        int port = server.getAddress().getPort();
+
+        String registrationUrl = "http://127.0.0.1:" + port + "/loop.mar";
+        List<String> strictAllowed =
+                Collections.singletonList("http://127\\.0\\.0\\.1:" + port + "/.*");
+
+        try {
+            File downloaded = new File(modelStore, "loop.mar");
+            DownloadArchiveException exception =
+                    Assert.expectThrows(
+                            DownloadArchiveException.class,
+                            () -> ModelArchive.downloadModel(strictAllowed, modelStore, registrationUrl));
+            Assert.assertTrue(exception.getCause() instanceof IOException);
+            Assert.assertEquals(
+                    exception.getCause().getMessage(),
+                    "Too many redirects while downloading archive from: " + registrationUrl);
+            Assert.assertFalse(
+                    downloaded.exists(),
+                    "Model archive should not be written when redirects exceed the limit");
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            FileUtils.deleteQuietly(modelStoreDir);
+        }
+    }
+
     @Test(expectedExceptions = DownloadArchiveException.class)
     public void testMalformLocalURL()
             throws ModelException, IOException, InterruptedException, DownloadArchiveException {
