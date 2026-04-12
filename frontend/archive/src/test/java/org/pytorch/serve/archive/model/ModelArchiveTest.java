@@ -16,6 +16,7 @@ import org.apache.commons.io.FileUtils;
 import org.pytorch.serve.archive.DownloadArchiveException;
 import org.testng.Assert;
 import org.testng.annotations.BeforeTest;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 public class ModelArchiveTest {
@@ -201,8 +202,9 @@ public class ModelArchiveTest {
                     ModelArchive.downloadModel(ALLOWED_URLS_LIST, modelStore, fileUrl);
         } catch (ModelNotFoundException e) {
             String expectedMessagePattern = "Relative path is not allowed in url: " + fileUrl;
-            Assert.assertTrue(
-                    e.getMessage().matches(expectedMessagePattern),
+            Assert.assertEquals(
+                    e.getMessage(),
+                    expectedMessagePattern,
                     "Exception message does not match the expected pattern.");
         }
 
@@ -384,6 +386,62 @@ public class ModelArchiveTest {
             Assert.assertFalse(
                     downloaded.exists(),
                     "Model archive should not be written when redirects exceed the limit");
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            FileUtils.deleteQuietly(modelStoreDir);
+        }
+    }
+
+    @DataProvider(name = "successfulRedirectStatuses")
+    public Object[][] successfulRedirectStatuses() {
+        return new Object[][] {{307}, {308}};
+    }
+
+    @Test(dataProvider = "successfulRedirectStatuses")
+    public void testRelativeRedirectWithinAllowedUrlsDownloadsArchive(int redirectStatusCode)
+            throws Exception {
+        String modelStore = "build/tmp/test/model_store_successful_redirect_" + redirectStatusCode;
+        File modelStoreDir = new File(modelStore);
+        FileUtils.deleteQuietly(modelStoreDir);
+        modelStoreDir.mkdirs();
+
+        File marFixture = new File("src/test/resources/models/mnist.mar");
+        byte[] marBytes = Files.readAllBytes(marFixture.toPath());
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/redirect.mar",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Location", "/downloaded.mar");
+                    exchange.sendResponseHeaders(redirectStatusCode, -1);
+                    exchange.close();
+                });
+        server.createContext(
+                "/downloaded.mar",
+                exchange -> {
+                    exchange.sendResponseHeaders(200, marBytes.length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(marBytes);
+                    }
+                });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        server.setExecutor(executor);
+        server.start();
+        int port = server.getAddress().getPort();
+
+        String registrationUrl = "http://127.0.0.1:" + port + "/redirect.mar";
+        List<String> strictAllowed =
+                Collections.singletonList("http://127\\.0\\.0\\.1:" + port + "/.*");
+
+        try {
+            ModelArchive archive =
+                    ModelArchive.downloadModel(strictAllowed, modelStore, registrationUrl);
+            File redirectedDownload = new File(modelStore, "redirect.mar");
+            Assert.assertTrue(redirectedDownload.exists(), "Redirected archive should be written");
+            Assert.assertEquals(archive.getModelName(), "mnist");
+            archive.validate();
+            archive.clean();
         } finally {
             server.stop(0);
             executor.shutdownNow();
