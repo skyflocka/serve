@@ -395,7 +395,7 @@ public class ModelArchiveTest {
 
     @DataProvider(name = "successfulRedirectStatuses")
     public Object[][] successfulRedirectStatuses() {
-        return new Object[][] {{307}, {308}};
+        return new Object[][] {{301}, {302}, {303}, {307}, {308}};
     }
 
     @Test(dataProvider = "successfulRedirectStatuses")
