@@ -1,14 +1,21 @@
 package org.pytorch.serve.archive.workflow;
 
+import com.sun.net.httpserver.HttpServer;
 import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.apache.commons.io.FileUtils;
 import org.pytorch.serve.archive.DownloadArchiveException;
 import org.testng.Assert;
 import org.testng.annotations.BeforeTest;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 public class WorkFlowArchiveTest {
@@ -74,5 +81,61 @@ public class WorkFlowArchiveTest {
                 customUrlPatternList,
                 workflowStore,
                 "https://torchserve.pytorch.org/mar_files/mnist.war");
+    }
+
+    @DataProvider(name = "successfulRedirectStatuses")
+    public Object[][] successfulRedirectStatuses() {
+        return new Object[][] {{301}, {302}, {303}, {307}, {308}};
+    }
+
+    @Test(dataProvider = "successfulRedirectStatuses")
+    public void testRelativeRedirectWithinAllowedUrlsDownloadsWorkflow(int redirectStatusCode)
+            throws Exception {
+        String workflowStore = "build/tmp/test/workflow_store_successful_redirect_" + redirectStatusCode;
+        File workflowStoreDir = new File(workflowStore);
+        FileUtils.deleteQuietly(workflowStoreDir);
+        workflowStoreDir.mkdirs();
+
+        File warFixture = new File("src/test/resources/workflows/smtest.war");
+        byte[] warBytes = Files.readAllBytes(warFixture.toPath());
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/redirect.war",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Location", "/downloaded.war");
+                    exchange.sendResponseHeaders(redirectStatusCode, -1);
+                    exchange.close();
+                });
+        server.createContext(
+                "/downloaded.war",
+                exchange -> {
+                    exchange.sendResponseHeaders(200, warBytes.length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(warBytes);
+                    }
+                });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        server.setExecutor(executor);
+        server.start();
+        int port = server.getAddress().getPort();
+
+        String registrationUrl = "http://127.0.0.1:" + port + "/redirect.war";
+        List<String> strictAllowed =
+                Collections.singletonList("http://127\\.0\\.0\\.1:" + port + "/.*");
+
+        try {
+            WorkflowArchive archive =
+                    WorkflowArchive.downloadWorkflow(strictAllowed, workflowStore, registrationUrl);
+            File redirectedDownload = new File(workflowStore, "redirect.war");
+            Assert.assertTrue(redirectedDownload.exists(), "Redirected workflow should be written");
+            Assert.assertEquals(archive.getWorkflowName(), "smtest");
+            archive.validate();
+            archive.clean();
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            FileUtils.deleteQuietly(workflowStoreDir);
+        }
     }
 }
