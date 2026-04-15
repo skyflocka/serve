@@ -83,6 +83,119 @@ public class WorkFlowArchiveTest {
                 "https://torchserve.pytorch.org/mar_files/mnist.war");
     }
 
+    @Test
+    public void testRedirectTargetNotRevalidatedAgainstAllowedUrls()
+            throws Exception {
+        String workflowStore = "build/tmp/test/workflow_store_redirect";
+        File workflowStoreDir = new File(workflowStore);
+        FileUtils.deleteQuietly(workflowStoreDir);
+        workflowStoreDir.mkdirs();
+
+        File warFixture = new File("src/test/resources/workflows/smtest.war");
+        byte[] warBytes = Files.readAllBytes(warFixture.toPath());
+
+        HttpServer secondHopServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        secondHopServer.createContext(
+                "/blocked.war",
+                exchange -> {
+                    exchange.sendResponseHeaders(200, warBytes.length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(warBytes);
+                    }
+                });
+        ExecutorService secondHopExecutor = Executors.newSingleThreadExecutor();
+        secondHopServer.setExecutor(secondHopExecutor);
+        secondHopServer.start();
+        int secondPort = secondHopServer.getAddress().getPort();
+
+        HttpServer firstHopServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        firstHopServer.createContext(
+                "/allowed.war",
+                exchange -> {
+                    String location = "http://127.0.0.1:" + secondPort + "/blocked.war";
+                    exchange.getResponseHeaders().add("Location", location);
+                    exchange.sendResponseHeaders(302, -1);
+                    exchange.close();
+                });
+        ExecutorService firstHopExecutor = Executors.newSingleThreadExecutor();
+        firstHopServer.setExecutor(firstHopExecutor);
+        firstHopServer.start();
+        int firstPort = firstHopServer.getAddress().getPort();
+
+        String allowedPattern = "http://127\\.0\\.0\\.1:" + firstPort + "/.*";
+        List<String> strictAllowed = Collections.singletonList(allowedPattern);
+        String registrationUrl = "http://127.0.0.1:" + firstPort + "/allowed.war";
+        String blockedUrl = "http://127.0.0.1:" + secondPort + "/blocked.war";
+
+        try {
+            File downloaded = new File(workflowStore, "allowed.war");
+            WorkflowNotFoundException exception =
+                    Assert.expectThrows(
+                            WorkflowNotFoundException.class,
+                            () ->
+                                    WorkflowArchive.downloadWorkflow(
+                                            strictAllowed, workflowStore, registrationUrl));
+            Assert.assertEquals(
+                    exception.getMessage(),
+                    "Given URL " + blockedUrl + " does not match any allowed URL(s)");
+            Assert.assertFalse(
+                    downloaded.exists(),
+                    "Workflow archive should not be downloaded when a redirect leaves allowed_urls");
+        } finally {
+            firstHopServer.stop(0);
+            secondHopServer.stop(0);
+            firstHopExecutor.shutdownNow();
+            secondHopExecutor.shutdownNow();
+            FileUtils.deleteQuietly(workflowStoreDir);
+        }
+    }
+
+    @Test
+    public void testRedirectMissingLocationHeaderFailsDownload()
+            throws Exception {
+        String workflowStore = "build/tmp/test/workflow_store_missing_location";
+        File workflowStoreDir = new File(workflowStore);
+        FileUtils.deleteQuietly(workflowStoreDir);
+        workflowStoreDir.mkdirs();
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/missing-location.war",
+                exchange -> {
+                    exchange.sendResponseHeaders(302, -1);
+                    exchange.close();
+                });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        server.setExecutor(executor);
+        server.start();
+        int port = server.getAddress().getPort();
+
+        String registrationUrl = "http://127.0.0.1:" + port + "/missing-location.war";
+        List<String> strictAllowed =
+                Collections.singletonList("http://127\\.0\\.0\\.1:" + port + "/.*");
+
+        try {
+            File downloaded = new File(workflowStore, "missing-location.war");
+            DownloadArchiveException exception =
+                    Assert.expectThrows(
+                            DownloadArchiveException.class,
+                            () ->
+                                    WorkflowArchive.downloadWorkflow(
+                                            strictAllowed, workflowStore, registrationUrl));
+            Assert.assertTrue(exception.getCause() instanceof IOException);
+            Assert.assertEquals(
+                    exception.getCause().getMessage(),
+                    "Redirect response missing Location header for: " + registrationUrl);
+            Assert.assertFalse(
+                    downloaded.exists(),
+                    "Workflow archive should not be written when a redirect omits Location");
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            FileUtils.deleteQuietly(workflowStoreDir);
+        }
+    }
+
     @DataProvider(name = "successfulRedirectStatuses")
     public Object[][] successfulRedirectStatuses() {
         return new Object[][] {{301}, {302}, {303}, {307}, {308}};
