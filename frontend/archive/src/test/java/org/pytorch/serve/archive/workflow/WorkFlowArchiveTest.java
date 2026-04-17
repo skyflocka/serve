@@ -196,6 +196,53 @@ public class WorkFlowArchiveTest {
         }
     }
 
+    @Test
+    public void testRedirectLoopFailsAfterMaxRedirects()
+            throws Exception {
+        String workflowStore = "build/tmp/test/workflow_store_redirect_loop";
+        File workflowStoreDir = new File(workflowStore);
+        FileUtils.deleteQuietly(workflowStoreDir);
+        workflowStoreDir.mkdirs();
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/loop.war",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Location", "/loop.war");
+                    exchange.sendResponseHeaders(302, -1);
+                    exchange.close();
+                });
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        server.setExecutor(executor);
+        server.start();
+        int port = server.getAddress().getPort();
+
+        String registrationUrl = "http://127.0.0.1:" + port + "/loop.war";
+        List<String> strictAllowed =
+                Collections.singletonList("http://127\\.0\\.0\\.1:" + port + "/.*");
+
+        try {
+            File downloaded = new File(workflowStore, "loop.war");
+            DownloadArchiveException exception =
+                    Assert.expectThrows(
+                            DownloadArchiveException.class,
+                            () ->
+                                    WorkflowArchive.downloadWorkflow(
+                                            strictAllowed, workflowStore, registrationUrl));
+            Assert.assertTrue(exception.getCause() instanceof IOException);
+            Assert.assertEquals(
+                    exception.getCause().getMessage(),
+                    "Too many redirects while downloading archive from: " + registrationUrl);
+            Assert.assertFalse(
+                    downloaded.exists(),
+                    "Workflow archive should not be written when redirects exceed the limit");
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            FileUtils.deleteQuietly(workflowStoreDir);
+        }
+    }
+
     @DataProvider(name = "successfulRedirectStatuses")
     public Object[][] successfulRedirectStatuses() {
         return new Object[][] {{301}, {302}, {303}, {307}, {308}};
